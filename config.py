@@ -11,6 +11,7 @@ MEMORY_COUNTER = 0          # for store experience
 LEARNING_STEP_COUNTER = 0   # for target updating
 MAX_PRICE = 3500
 MIN_PRICE = 1500
+NUM_SEG= 1000
 MAX_SALE = 20
 SIM_SALE_PATH = '../data/2hours_price_setting_env.csv'
 WEIGHT_PATH = './weights/'

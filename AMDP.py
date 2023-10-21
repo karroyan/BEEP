@@ -94,6 +94,7 @@ for k in range(K):
         r_lambda = r + lambda_i * (c-xi)
 
         sum_cxi += (c-xi)
+        print(sale, true_s_)
 
         fake_s_ = np.array([f(true_s_[0]), true_s_[1]]) # 这里是不是有问题
         dqn.store_transition(fake_s,a,r_lambda,fake_s_)
@@ -110,6 +111,7 @@ for k in range(K):
     if k %10 == 0 and k > 0:
         if k%100 == 0:
             print('Total reward for episode {} is {}'.format(k, average_reward/10))
+            print_sum_cxi = 0
         total_reward_recorder.append(average_reward / 10)
         average_reward = 0
         #print('The last pricing process is {}'.format(recoder))
