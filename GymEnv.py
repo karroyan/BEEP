@@ -2,16 +2,23 @@ import random
 import gym
 from gym import spaces
 import numpy as np
+from gym.utils import seeding
 import config
 from SimEnv import Environment
+from ding.envs import BaseEnv, BaseEnvTimestep
+from ding.torch_utils import to_ndarray, to_list
+from ding.utils import ENV_REGISTRY
+from ding.envs import ObsPlusPrevActRewWrapper
 
-class Liner_Environment(gym.Env):
+
+@ENV_REGISTRY.register('beep')
+class Liner_Environment(BaseEnv):
     '''
     Environment for the container sales in liner shipping scenerio.
     Applied the constraints described in BEEP
     '''
 
-    def __init__(self, price: float, c_bar: int, K: int, path: str, action_range: int):
+    def __init__(self, cfg:dict):
         '''
         self.state will not be initlized here, need be reset
 
@@ -22,14 +29,14 @@ class Liner_Environment(gym.Env):
         - path(str): the path of history sale data, end in .csv
         - action_range(int): the absolute action range
         '''
-        self.state
-        self.price = price
+        action_range=40
+        self.price = 2000
         self.H = 70 # 14days * 5/day
         self.remaining_time = self.H 
         self.SALE = 50
-        self.PRICE = price
-        self.c_bar = c_bar
-        self.K = K
+        self.PRICE = 2000
+        self.c_bar = 10
+        self.K = 10000
 
         self.action_range = action_range
         self.num_seg = config.NUM_SEG
@@ -37,7 +44,7 @@ class Liner_Environment(gym.Env):
         self.min_price = config.MIN_PRICE
         self.max_sale = config.MAX_SALE
 
-        self.env = Environment(path, 'gamma')
+        self.env = Environment('../data/2hours_price_setting_env.csv', 'gamma')
         
         # reward calculate parameters
         self.Nk = {}
@@ -50,18 +57,34 @@ class Liner_Environment(gym.Env):
         self.sum_cxi = 0
         self.lambda_i = 0
         self.max_reward = self.max_price * 50
-        self.f = lambda x: int((x-self.min_price) / (self.max_price-self.min_price) * self.num_seg)
-        self.f_inv = lambda x: self.min_price + x * (self.max_price-self.min_price) / self.num_seg
-        self.f_reward = lambda x:x/self.max_reward
 
-        assert self.max_price <= self.min_price, 'The max price should be larger than the min price'
+        assert self.max_price > self.min_price, 'The max price should be larger than the min price'
         # The action space is the discrete space within 2*action_range, with one yuan as an interval
         # Notice the action here is not real action, it should be map to [-action_range, action_range]
         self.action_space = spaces.Discrete(2*self.action_range)
         # The state space has two dimension, price and remaining time
         self.observation_space = spaces.Box(low=np.array([self.min_price, 0]), \
                                             high=np.array([self.max_price, self.remaining_time]), dtype=np.float32)
+        self.reward_space = spaces.Box(low=0, high=self.max_price * self.xi, dtype=np.float32)
+        self.reward_threshold = 0.0
+        self.trials = 100
+        self.max_episode_steps = 70
+        self.id = "Liner"
 
+    def f(self, x):
+        return int((x-self.min_price) / (self.max_price-self.min_price) * self.num_seg)
+    
+    def f_inv(self, x):
+        return self.min_price + x * (self.max_price-self.min_price) / self.num_seg
+    
+    def f_reward(self, x):
+        return x/self.max_reward
+
+    def seed(self, seed: int, dynamic_seed: bool = True):
+        self._seed=seed
+        self._dynamic_seed=dynamic_seed
+        np.random.seed(self._seed)
+    
     def reset(self):
         '''
         reset the initial price and remainingtime
@@ -72,10 +95,18 @@ class Liner_Environment(gym.Env):
         self.price = self.PRICE
         self.remaining_time = 70
         self.state = np.array([self.price, self.remaining_time])
+        self.next_state = None
+        self.reward = None
+        self.episode_reward = 0
+        self.remaining_container = self.xi
+        self.done = False
 
         return self.state
+    
+    def reset_environment(self):
+        return self.reset()
 
-    def step(self, action: int):
+    def step(self, action):
         '''
         Move one step in the environment and return result.
 
@@ -88,6 +119,8 @@ class Liner_Environment(gym.Env):
         - done(bool): whether the episode finished
         '''
         p = random.random()
+        info = {}
+        action = action[0]
         real_action = action - self.action_range
         # price can not be changed out of the price range: [self.min_price, self.max_price]
         self.price = max(self.min_price, min(self.max_price, self.price + real_action))
@@ -99,14 +132,24 @@ class Liner_Environment(gym.Env):
         else:
             # If the episode is not corrputed, the sale will be estimated from the history sale data
             sale = self.env.ave_sale(self.price)
-
-        self.state = np.array([self.price, self.remaining_time])
+        self.state = to_ndarray([float(self.price), float(self.remaining_time)]).astype(np.float32)
         if self.remaining_time <= 0:
-            done = True
+            self.done = True
         
-        reward = self.reward_cal(self.state, action, done, int(sale))
+        self.reward = self.reward_cal(self.state, action, self.done, int(sale))
+        self.reward = to_ndarray([self.reward]).astype(np.float32)
+        if self.remaining_container < sale:
+            self.episode_reward += self.remaining_container * self.state[0]
+            self.remaining_container = 0
+        else:
+            self.episode_reward += sale * self.state[0]
+            self.remaining_container -= sale
 
-        return self.state, reward, done, {}
+
+        if self.done:
+            info['eval_episode_return'] = self.episode_reward
+
+        return BaseEnvTimestep(self.state, self.reward, self.done, info)
 
     def reward_cal(self, state, action: int, done: bool, sale: int):
         '''
@@ -118,8 +161,8 @@ class Liner_Environment(gym.Env):
 
         '''
         # fake state is used to record the visit times Nk
-        fake_state = np.array([self.f(state[0]), state[1]])
 
+        fake_state = np.array([self.f(state[0]), state[1]])
         if (tuple(fake_state),action) in self.Nk:
             self.Nk[(tuple(fake_state),action)] += 1
         else:
@@ -144,3 +187,9 @@ class Liner_Environment(gym.Env):
     def expectation(self, price):
         sale = self.env.expectation_sale(price)
         return sale
+
+    def __repr__(self) -> str:
+        return "Beep Env"
+    
+    def close(self) -> None:
+        pass
